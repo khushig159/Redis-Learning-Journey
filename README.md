@@ -608,6 +608,307 @@ docker run -d --name redis-dev -p 6379:6379 redis:7
 node examples/08-geospatial.js
 ```
 
+### Example 8: Full Real-World App — Cache-Aside + Rate Limiting + Cache Invalidation
+
+> **This is the crown jewel** — a **complete Express.js API** that uses **Redis** for:
+> - **Caching expensive responses**
+> - **Rate limiting per IP**
+> - **Cache invalidation on write**
+>
+> It demonstrates **production-ready patterns** using **only `String` data type** — the most common in real apps.
+
+---
+
+### What You’ll Learn
+
+| Concept | Why It Matters |
+|-------|----------------|
+| **Cache-Aside Pattern** | Read from cache → if miss → DB → write to cache |
+| **Rate Limiting** | Prevent abuse using `INCR` + `EXPIRE` |
+| **Cache Invalidation** | Delete stale cache after mutation |
+| **Middleware Reuse** | `getcachedDate`, `rateLimiter` |
+| **Key Naming Strategy** | `product:1`, `192.168.1.1:products:request_count` |
+
+---
+
+### Project Files
+
+```
+app.js
+products.js
+middleware/redis.js
+```
+
+---
+
+### 1. `products.js` — Simulated Slow Data Layer
+
+```js
+// products.js
+export const getProducts = () => {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve([
+        { id: 1, name: "Product 1", price: 100 }
+      ]);
+    }, 2000); // 2-second DB delay
+  });
+};
+
+export const getProductsdetails = (id) => {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve({
+        products: {
+          id: +id,
+          name: `Product ${id}`,
+          price: Math.floor(Math.random() * id * 100),
+        },
+      });
+    }, 2000);
+  });
+};
+```
+
+> **Analogy**: This is your **slow database**. Every call takes 2 seconds.
+
+---
+
+### 2. `middleware/redis.js` — Reusable Redis Logic
+
+```js
+// middleware/redis.js
+import { redis } from "../app.js";
+
+// Cache middleware
+export const getcachedDate = (key) => async (req, res, next) => {
+  const data = await redis.get(key);
+  if (data) {
+    console.log("Cache HIT");
+    return res.json({ products: JSON.parse(data) });
+  }
+  console.log("Cache MISS");
+  next();
+};
+
+// Rate limiter middleware
+export const rateLimiter = ({ limit = 20, timer = 60, key }) => 
+  async (req, res, next) => {
+    const clientIP = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+    const fullkey = `${clientIP}:${key}:request_count`;
+    
+    const reqCount = await redis.incr(fullkey);
+    
+    if (reqCount === 1) {
+      await redis.expire(fullkey, timer);
+    }
+    
+    const ttl = await redis.ttl(fullkey);
+    
+    if (reqCount > limit) {
+      return res.status(429).send(
+        `Too many requests. Try again after ${ttl} seconds.`
+      );
+    }
+    next();
+  };
+```
+
+---
+
+### 3. `app.js` — Main Server with Full Redis Integration
+
+```js
+// app.js
+import express from 'express';
+import Redis from 'ioredis';
+import { getcachedDate, rateLimiter } from './middleware/redis.js';
+import { getProducts, getProductsdetails } from './products.js';
+
+const app = express();
+
+// Connect to Redis Cloud
+const redis = new Redis({
+  host: 'host_name',
+  port: XXXXX,
+  password: 'yout-password',
+});
+export { redis };
+
+// Home route — rate limited
+app.get('/', rateLimiter({ limit: 30, timer: 300, key: "home" }), (req, res) => {
+  res.send("Hello! You're allowed to visit.");
+});
+
+// List products — cached + rate limited
+app.get(
+  '/products',
+  rateLimiter({ limit: 5, timer: 20, key: "products" }),
+  getcachedDate("products"),
+  async (req, res) => {
+    const products = await getProducts();
+    await redis.setex("products", 20, JSON.stringify(products));
+    res.json({ products });
+  }
+);
+
+// Single product — per-item cache
+app.get('/product/:id', async (req, res) => {
+  const id = req.params.id;
+  const key = `product:${id}`;
+  
+  const cached = await redis.get(key);
+  if (cached) {
+    console.log("Product from cache");
+    return res.json({ product: JSON.parse(cached) });
+  }
+
+  const product = await getProductsdetails(id);
+  await redis.set(key, JSON.stringify(product));
+  res.json({ product });
+});
+
+// Order → invalidate cache
+app.get('/order/:id', async (req, res) => {
+  const productId = req.params.id;
+  const key = `product:${productId}`;
+
+  // Simulate DB mutation
+  // Then invalidate cache
+  await redis.del(key);
+
+  res.json({
+    message: `Order placed! Product ${productId} is ordered.`,
+  });
+});
+
+app.listen(3000, () => {
+  console.log("Server running on http://localhost:3000");
+});
+```
+
+---
+
+## How It All Works — Step-by-Step Breakdown
+
+### 1. **Cache-Aside Pattern** (`/products`)
+
+| Step | Action |
+|------|--------|
+| 1 | Client calls `GET /products` |
+| 2 | `rateLimiter` checks IP + path |
+| 3 | `getcachedDate("products")` checks Redis |
+| 4 | **Cache HIT** → return cached JSON **instantly** |
+| 5 | **Cache MISS** → call `getProducts()` → 2s delay → store with `SETEX 20` |
+
+> **Result**: First request = 2s, next 20s = **<10ms**
+
+---
+
+### 2. **Rate Limiting** (`INCR` + `EXPIRE`)
+
+| Key | Value |
+|-----|-------|
+| `192.168.1.1:products:request_count` | `3` |
+
+```js
+await redis.incr(fullkey)  // Atomically +1
+await redis.expire(fullkey, 20)  // Auto-delete after 20s
+```
+
+> **Prevents abuse** — 5 requests per 20 seconds per IP
+
+---
+
+### 3. **Cache Invalidation** (`/order/:id`)
+
+```js
+await redis.del(`product:${id}`)
+```
+
+> After placing an order, **stale cache is deleted**  
+> Next request will fetch **fresh data**
+
+---
+
+## Redis Data Types Used
+
+| Data Type | Key Example | Purpose |
+|---------|-------------|--------|
+| **String** | `products` | Store `JSON.stringify(products)` |
+| **String** | `product:1` | Cache single product |
+| **String** | `192.168.1.1:home:request_count` | Rate limit counter |
+| **TTL** | `SETEX key 20 value` | Auto-expire cache |
+| **TTL** | `EXPIRE key 20` | Auto-clean rate limit |
+
+> **Only `String` used** — but **most powerful** in real apps!
+
+---
+
+## Flow Diagram
+<img width="843" height="941" alt="image" src="https://github.com/user-attachments/assets/9850c0ed-d99b-4c59-b48f-159b0d6a3ff6" />
+
+---
+
+## Output Examples
+
+### First Request (Cache Miss)
+```bash
+Cache MISS
+# 2-second delay
+→ { products: [...] }
+```
+
+### Second Request (Cache Hit)
+```bash
+Cache HIT
+→ { products: [...] }  (instant!)
+```
+
+### Rate Limit Exceeded
+```http
+429 Too Many Requests
+Too many requests. Try again after 12 seconds.
+```
+
+---
+
+## Why This Pattern Is Production-Ready
+
+| Benefit | How It's Achieved |
+|-------|-------------------|
+| **Speed** | Cache hits skip DB |
+| **Scalability** | DB load reduced |
+| **Freshness** | `SETEX` ensures data expires |
+| **Consistency** | `DEL` on write |
+| **Security** | Rate limiting per IP |
+
+---
+
+> **Pro Tip**: Use cache versioning:
+> ```js
+> await redis.set('products:v2', data)
+> ```
+> To force refresh without deleting old keys.
+
+---
+
+## Running the Examples
+
+```bash
+# 1. Install
+npm install express ioredis
+
+# 2. Run
+node app.js
+```
+
+Test:
+```bash
+curl http://localhost:3000/products
+curl http://localhost:3000/product/1
+curl http://localhost:3000/order/1
+```
 ---
 
 ## Best Practices & Gotchas
